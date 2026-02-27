@@ -369,11 +369,11 @@ static bool connectWiFi()
 
 static void syncNTP()
 {
-    configTzTime("AWST-8", "pool.ntp.org", "time.nist.gov");
+    configTzTime("UTC", "pool.ntp.org", "time.nist.gov");
     Serial.print(F("[INIT] NTP sync .................... "));
     struct tm t;
     if (getLocalTime(&t, 5000)) {
-        Serial.printf("OK (%04d-%02d-%02d %02d:%02d:%02d AWST)\n",
+        Serial.printf("OK (%04d-%02d-%02d %02d:%02d:%02d UTC)\n",
                       t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                       t.tm_hour, t.tm_min, t.tm_sec);
     } else {
