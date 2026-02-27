@@ -14,7 +14,7 @@
 //  Firmware Identity
 // ============================================================================
 #define FW_NAME    "Underling"
-#define FW_VERSION "2.0.0"
+#define FW_VERSION "2.1.0"
 
 // ============================================================================
 //  GPIO Pin Assignments — ESP32 WROOM-32
@@ -90,3 +90,25 @@ namespace nvs_cfg {
     constexpr const char* KEY_TEMP_BASE = "tbase";
 
 }  // namespace nvs_cfg
+
+// ============================================================================
+//  Network Configuration — WiFi + ClickHouse
+// ============================================================================
+namespace net_cfg {
+
+    // --- WiFi (scan both SSIDs, connect to strongest) ---
+    constexpr const char* WIFI_SSIDS[]     = { "Atomshed", "Atom" };
+    constexpr size_t      WIFI_SSID_COUNT  = sizeof(WIFI_SSIDS) / sizeof(WIFI_SSIDS[0]);
+    constexpr const char* WIFI_PASS        = "Tpsnbd2a";   // Same for all
+    constexpr uint32_t    WIFI_TIMEOUT_MS  = 10000;   // Give up after 10 s
+
+    // --- ClickHouse (HTTP interface) ---
+    constexpr const char* CH_HOST          = "10.1.1.2";
+    constexpr uint16_t    CH_PORT          = 8123;
+    constexpr const char* CH_USER          = "admin";
+    constexpr const char* CH_PASS          = "ClickHouse2026!";
+    constexpr const char* CH_DATABASE      = "sensor_data";
+    constexpr const char* CH_TABLE         = "weight_readings";
+    constexpr uint32_t    HTTP_TIMEOUT_MS  = 5000;
+
+}  // namespace net_cfg

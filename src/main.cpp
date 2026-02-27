@@ -2,13 +2,14 @@
 //  main.cpp — Underling Plant Transpiration Monitor
 // ============================================================================
 //
-//  Serial-only firmware.  Single FreeRTOS task on Core 1.
+//  Firmware with ClickHouse integration.  Single FreeRTOS task on Core 1.
 //
 //  Pipeline (every 30 s):
 //    1. Read ADC (50-sample trimmed mean)
 //    2. Apply calibration:  weight = (raw - tare) / scale
 //    3. Apply temperature compensation (disabled, coeff = 0)
 //    4. Print one line to serial
+//    5. POST row to ClickHouse via HTTP
 //
 //  Commands via serial: TARE | CAL <grams>
 //  Tare button on GPIO 32 (active-LOW).
@@ -16,6 +17,9 @@
 // ============================================================================
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>
 #include "config.h"
 #include "ads1232_driver.h"
 #include "calibration_store.h"
@@ -42,6 +46,9 @@ static void measurementTask(void* param);
 static void printBanner();
 static void performTare();
 static void performCalibration(float knownWeightG);
+static bool connectWiFi();
+static void syncNTP();
+static bool postToClickHouse(float weightG, float tempC, uint32_t uptimeS);
 
 // ============================================================================
 //  Setup
@@ -82,6 +89,17 @@ void setup()
 
     // ---- Tare Button ----
     pinMode(pins::TARE_BUTTON, INPUT_PULLUP);
+
+    // ---- WiFi ----
+    Serial.print(F("[INIT] WiFi ........................ "));
+    if (connectWiFi()) {
+        Serial.printf("OK (%s, %s)\n",
+                      WiFi.localIP().toString().c_str(),
+                      WiFi.SSID().c_str());
+        syncNTP();
+    } else {
+        Serial.println(F("FAILED (continuing offline)"));
+    }
 
     // ---- Load or create calibration (NEVER auto-tare) ----
     if (calStore.load(calData) && calData.valid) {
@@ -226,6 +244,18 @@ static void measurementTask(void* /*param*/)
         Serial.printf("[%7lu] W: %8.1f g",
                       now / 1000, weight);
         if (!isnan(lastTempExt)) Serial.printf(" | T: %.1fC", lastTempExt);
+
+        // ---- ClickHouse POST ----
+        if (WiFi.status() == WL_CONNECTED) {
+            bool ok = postToClickHouse(weight, lastTempExt, now / 1000);
+            Serial.printf(" | CH: %s", ok ? "OK" : "FAIL");
+        } else {
+            // Try reconnecting every cycle
+            if (connectWiFi()) {
+                Serial.print(F(" | WiFi reconnected"));
+            }
+        }
+
         Serial.println();
 
         readingNum++;
@@ -286,6 +316,115 @@ static void performCalibration(float knownWeightG)
     calStore.saveScaleFactor(calData.scaleFactor);
 
     Serial.printf("[CAL] Done -- scale: %.6f counts/g\n", calData.scaleFactor);
+}
+
+// ============================================================================
+//  WiFi & ClickHouse
+// ============================================================================
+
+static bool connectWiFi()
+{
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+
+    // Scan for available networks
+    int n = WiFi.scanNetworks();
+    if (n <= 0) {
+        Serial.println(F("[WIFI] No networks found"));
+        WiFi.scanDelete();
+        return false;
+    }
+
+    // Find the strongest RSSI among our configured SSIDs
+    const char* bestSSID = nullptr;
+    int32_t     bestRSSI = -999;
+
+    for (int i = 0; i < n; i++) {
+        for (size_t s = 0; s < net_cfg::WIFI_SSID_COUNT; s++) {
+            if (WiFi.SSID(i) == net_cfg::WIFI_SSIDS[s] &&
+                WiFi.RSSI(i) > bestRSSI) {
+                bestSSID = net_cfg::WIFI_SSIDS[s];
+                bestRSSI = WiFi.RSSI(i);
+            }
+        }
+    }
+    WiFi.scanDelete();
+
+    if (!bestSSID) {
+        Serial.println(F("[WIFI] No matching SSID found"));
+        return false;
+    }
+
+    Serial.printf("[WIFI] Connecting to %s (RSSI %d dBm)\n", bestSSID, bestRSSI);
+    WiFi.begin(bestSSID, net_cfg::WIFI_PASS);
+
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED &&
+           (millis() - start) < net_cfg::WIFI_TIMEOUT_MS) {
+        delay(250);
+    }
+    return WiFi.status() == WL_CONNECTED;
+}
+
+static void syncNTP()
+{
+    configTzTime("UTC", "pool.ntp.org", "time.nist.gov");
+    Serial.print(F("[INIT] NTP sync .................... "));
+    struct tm t;
+    if (getLocalTime(&t, 5000)) {
+        Serial.printf("OK (%04d-%02d-%02d %02d:%02d:%02d UTC)\n",
+                      t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                      t.tm_hour, t.tm_min, t.tm_sec);
+    } else {
+        Serial.println(F("TIMEOUT (will use uptime)"));
+    }
+}
+
+static bool postToClickHouse(float weightG, float tempC, uint32_t uptimeS)
+{
+    // Build timestamp from NTP or fall back to a fixed epoch + uptime
+    char tsBuf[32];
+    struct tm t;
+    if (getLocalTime(&t, 0)) {
+        strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%d %H:%M:%S", &t);
+    } else {
+        snprintf(tsBuf, sizeof(tsBuf), "1970-01-01 00:00:%02lu", uptimeS % 60);
+    }
+
+    // Build URL with query param
+    char url[256];
+    snprintf(url, sizeof(url),
+             "http://%s:%u/?user=%s&password=%s"
+             "&query=INSERT%%20INTO%%20%s.%s%%20FORMAT%%20JSONEachRow",
+             net_cfg::CH_HOST, net_cfg::CH_PORT,
+             net_cfg::CH_USER, net_cfg::CH_PASS,
+             net_cfg::CH_DATABASE, net_cfg::CH_TABLE);
+
+    // Build JSON body
+    char body[256];
+    if (isnan(tempC)) {
+        snprintf(body, sizeof(body),
+                 "{\"timestamp\":\"%s\",\"weight_g\":%.1f,"
+                 "\"uptime_s\":%lu,\"device_id\":\"underling\"}",
+                 tsBuf, weightG, (unsigned long)uptimeS);
+    } else {
+        snprintf(body, sizeof(body),
+                 "{\"timestamp\":\"%s\",\"weight_g\":%.1f,"
+                 "\"temperature_c\":%.1f,\"uptime_s\":%lu,"
+                 "\"device_id\":\"underling\"}",
+                 tsBuf, weightG, tempC, (unsigned long)uptimeS);
+    }
+
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(net_cfg::HTTP_TIMEOUT_MS);
+    http.addHeader("Content-Type", "application/json");
+
+    int code = http.POST((uint8_t*)body, strlen(body));
+    http.end();
+
+    return (code == 200);
 }
 
 // ============================================================================
